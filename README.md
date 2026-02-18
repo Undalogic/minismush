@@ -32,6 +32,10 @@ The project consists of a single-layer Node.js application with the following co
 
 ## Quick Start
 
+### Prerequisites
+- Node.js >= 16.0.0
+- Works on macOS, Linux, and Windows
+
 ### Installation
 ```bash
 npm install
@@ -41,13 +45,16 @@ npm install
 ```bash
 node nodeforwarder.js [HTTP_PORT] [SERIAL_PORT] [BAUD_RATE] [BUFFER_SIZE]
 
-# Example:
+# Example (Linux/macOS):
 node nodeforwarder.js 3000 /dev/ttyUSB0 115200 10000
+
+# Example (Windows):
+node nodeforwarder.js 3000 COM3 115200 10000
 ```
 
 ### Environment Variables
 - `PORT`: HTTP server port (default: 3000)
-- `SERIAL_PORT`: Serial device path (e.g., /dev/ttyUSB0)  
+- `SERIAL_PORT`: Serial device path (e.g., `/dev/ttyUSB0` on Linux/macOS, `COM3` on Windows)
 - `BAUD_RATE`: Serial communication baud rate (default: 115200)
 
 ## API Endpoints
@@ -81,6 +88,9 @@ POST /smu/measure_voltage_and_current  {"channel": 1}
 POST /smu/enable_channel       {"channel": 1}
 POST /smu/disable_channel      {"channel": 1}
 POST /smu/set_voltage_range    {"channel": 1, "range": "AUTO"}
+
+# Measurement Configuration
+POST /smu/set_osr              {"channel": 1, "osr": 4}  # Oversampling rate (0-15)
 ```
 
 ### Battery Cycling APIs
@@ -89,6 +99,7 @@ POST /smu/set_voltage_range    {"channel": 1, "range": "AUTO"}
 POST /cycler/start             {"steps": [...], "channel": 1}
 POST /cycler/stop              # Stop active cycling
 GET  /cycler/status            # Get current cycling status
+POST /cycler/set_log_interval  {"intervalMs": 10000}  # Throttle disk writes (min 100ms)
 
 # Data Access
 GET  /cycler/get_ch1_data      # Get channel 1 array data
@@ -148,6 +159,16 @@ GET  /log_status              # Get current logging status
 - **Cycling Context**: Step information and cycling state when active
 - **Channel-Specific**: Separate ch1/ch2 data streams with proper parsing
 
+### Log Interval Throttling
+When streaming data at high sample rates, disk writes can be throttled independently to prevent enormous log files. The default log interval is 10 seconds. WebSocket streaming and in-memory data accumulation are unaffected — only CSV/SQLite writes are throttled.
+
+```bash
+# Set log interval to 5 seconds
+curl -X POST http://localhost:3000/cycler/set_log_interval \
+  -H "Content-Type: application/json" \
+  -d '{"intervalMs": 5000}'
+```
+
 ### Flexible Data Formats
 - **CSV**: Human-readable, Excel-compatible with structured columns
 - **SQLite**: Structured database with full query capabilities
@@ -158,8 +179,8 @@ GET  /log_status              # Get current logging status
 ### Dependencies
 ```json
 {
-  "serialport": "^9.2.4",
-  "express": "^4.17.1", 
+  "serialport": "^12.0.0",
+  "express": "^4.17.1",
   "socket.io": "^4.3.1",
   "csv-writer": "^1.6.0",
   "sqlite3": "^5.0.2",
@@ -230,6 +251,14 @@ curl http://localhost:3000/cycler/get_ch2_data
 curl -X POST http://localhost:3000/cycler/analyze_step \
   -H "Content-Type: application/json" \
   -d '{"channel": 1, "step_type": "cc"}'
+```
+
+### Configuring Measurement Oversampling
+```bash
+# Set oversampling rate for channel 1 (0-15, higher = more averaging)
+curl -X POST http://localhost:3000/smu/set_osr \
+  -H "Content-Type: application/json" \
+  -d '{"channel": 1, "osr": 4}'
 ```
 
 ### WebSocket Data Streaming
