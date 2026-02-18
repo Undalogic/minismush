@@ -38,7 +38,7 @@ else
 	console.log(parts);
 	hp = parts[2]
 	try{sp = parts[3]}             catch(e){sp = undefined} 
-	try{baud = parseInt(parts[4])} catch(e){baud = undefined}
+	try{baud = parseInt(parts[4])} catch(e){baud = 115200}
 	try{blen = parseInt(parts[5])} catch(e){blen = 10000}
 }
 
@@ -51,7 +51,7 @@ var cors = require('cors')
 const server = require('http').createServer(app);
 var io = require('socket.io')(server,{cors:{methods: ["GET", "POST"]}});
 
-const SerialPort = require('serialport');
+const { SerialPort } = require('serialport');
 const createCsvWriter = require('csv-writer').createObjectCsvWriter;
 const sqlite3 = require('sqlite3').verbose();
 
@@ -102,7 +102,7 @@ function msleep(n) {
 
   function createNewPort(path,baud) {
 	  console.log(`Initializing serial port with path: ${path}`);
-	  serialPort = new SerialPort(path, { baudRate: baud });
+	  serialPort = new SerialPort({ path: path, baudRate: baud });
   
 	  // Attach event listeners
 	  serialPort.on('open', () => {
@@ -772,8 +772,11 @@ function processCyclerDataFromArray(voltage, current, timestamp, channel, dataAr
   
   cyclerState.stepData.push(dataPoint);
   
-  // Write to SQLite database if logging enabled
-  if (cyclerState.cyclerDataStmt) {
+  // Check if enough time has passed since last log (for interval control)
+  const shouldLog = (now - cyclerState.lastLogTime) >= cyclerState.logIntervalMs;
+  
+  // Write to SQLite database if logging enabled and interval has passed
+  if (cyclerState.cyclerDataStmt && shouldLog) {
     try {
       cyclerState.cyclerDataStmt.run(
         dataPoint.timestamp,
@@ -791,13 +794,14 @@ function processCyclerDataFromArray(voltage, current, timestamp, channel, dataAr
         null, // temperature_c
         JSON.stringify(arrayAnalysis) // Store array analysis as JSON
       );
+      cyclerState.lastLogTime = now; // Update last log time
     } catch (err) {
       console.error('Cycler SQLite write error:', err);
     }
   }
   
-  // Also write to CSV for compatibility
-  if (cyclerState.cyclerCsvWriter) {
+  // Also write to CSV for compatibility (only if interval has passed)
+  if (cyclerState.cyclerCsvWriter && shouldLog) {
     cyclerState.cyclerCsvWriter.writeRecords([dataPoint]).catch(err => {
       console.error('Cycler CSV write error:', err);
     });
@@ -891,8 +895,11 @@ function processCyclerData(voltage, current) {
   
   cyclerState.stepData.push(dataPoint);
   
-  // Write to SQLite database if logging enabled
-  if (cyclerState.cyclerDataStmt) {
+  // Check if enough time has passed since last log (for interval control)
+  const shouldLog = (now - cyclerState.lastLogTime) >= cyclerState.logIntervalMs;
+  
+  // Write to SQLite database if logging enabled and interval has passed
+  if (cyclerState.cyclerDataStmt && shouldLog) {
     try {
       cyclerState.cyclerDataStmt.run(
         dataPoint.timestamp,
@@ -910,13 +917,14 @@ function processCyclerData(voltage, current) {
         null, // temperature_c
         null  // notes
       );
+      cyclerState.lastLogTime = now; // Update last log time
     } catch (err) {
       console.error('Cycler SQLite write error:', err);
     }
   }
   
-  // Also write to CSV for compatibility
-  if (cyclerState.cyclerCsvWriter) {
+  // Also write to CSV for compatibility (only if interval has passed)
+  if (cyclerState.cyclerCsvWriter && shouldLog) {
     cyclerState.cyclerCsvWriter.writeRecords([dataPoint]).catch(err => {
       console.error('Cycler CSV write error:', err);
     });
@@ -958,6 +966,7 @@ const smuState = {
       enabled: false,
       streaming: false,
       sampleRate: 1000,
+      osr: 0,
       mode: null // 'FVMI' for voltage control, 'FIMV' for current control
     },
     2: {
@@ -966,6 +975,7 @@ const smuState = {
       enabled: false,
       streaming: false,
       sampleRate: 1000,
+      osr: 0,
       mode: null
     }
   },
@@ -1059,6 +1069,10 @@ function stop_streaming(ch) {
 function set_sample_rate(ch, rate) { 
   writeout(`SOUR${ch}:DATA:SRATE ${rate}`);
   smuState.channels[ch].sampleRate = rate;
+}
+function set_osr(ch, osr) { 
+  writeout(`MEAS${ch}:OSR ${osr}`);
+  smuState.channels[ch].osr = osr;
 }
 
 // System Functions
@@ -1271,6 +1285,24 @@ app.post("/smu/set_sample_rate", (req,res) => {
   } catch (error) {
     console.error('Error setting sample rate:', error);
     res.status(500).json({ error: 'Failed to set sample rate' });
+  }
+})
+
+app.post("/smu/set_osr", (req,res) => {
+  try {
+    console.log(req.body);
+    const { channel, osr } = req.body;
+    if (channel === undefined || osr === undefined) {
+      return res.status(400).json({ error: 'Channel and OSR are required' });
+    }
+    if (osr < 0 || osr > 15) {
+      return res.status(400).json({ error: 'OSR must be between 0 and 15' });
+    }
+    set_osr(channel, osr);
+    response(res);
+  } catch (error) {
+    console.error('Error setting OSR:', error);
+    res.status(500).json({ error: 'Failed to set OSR' });
   }
 })
 
@@ -1693,6 +1725,8 @@ let cyclerState = {
   cyclerCsvWriter: null,
   cyclerDb: null,
   cyclerDataStmt: null,
+  lastLogTime: 0,           // Last time data was logged (for interval control)
+  logIntervalMs: 10000,     // Log interval in milliseconds (10 seconds)
   
   // Streaming data
   lastStreamingData: null
@@ -1964,13 +1998,20 @@ function checkStepCutoffs(voltage, current, stepTime) {
     cutoff_time_s: step.cutoff_time_s
   });
   
+  // Debug voltage comparison for CC charging
+  if (step.mode === 'cc' && step.current > 0 && step.cutoff_V !== undefined) {
+    console.log(`  🔍 CC Charge Debug: voltage(${voltage}) >= cutoff_V(${step.cutoff_V})? ${voltage >= step.cutoff_V}`);
+    console.log(`  🔍 Types: voltage=${typeof voltage}, cutoff_V=${typeof step.cutoff_V}`);
+  }
+  
   // Voltage cutoffs (same for all modes)
   if (step.cutoff_V !== undefined) {
     if (step.mode === 'cc') {
-      // CC mode: directional voltage cutoffs
+      // CC mode: directional voltage cutoffs based on step current setpoint
+      // Use step.current (intended direction) for cutoff logic
       if ((step.current > 0 && voltage >= step.cutoff_V) ||
           (step.current < 0 && voltage <= step.cutoff_V)) {
-        console.log(`CC voltage cutoff reached: ${voltage}V (target: ${step.cutoff_V}V)`);
+        console.log(`CC voltage cutoff reached: ${voltage}V (target: ${step.cutoff_V}V, step current: ${step.current}A, measured: ${current}A)`);
         return true;
       }
     } else if (step.mode === 'cv') {
@@ -2118,18 +2159,24 @@ async function executeCurrentStep() {
         console.log(`Setting CC mode: ${step.current}A on channel ${cyclerState.channel}`);
         console.log(`Calling enable_channel(${cyclerState.channel})`);
         enable_channel(cyclerState.channel);
-        console.log(`Calling set_current(${cyclerState.channel}, ${step.current})`);
-        set_current(cyclerState.channel, step.current);
-        console.log(`Channel ${cyclerState.channel} enabled for CC step - commands sent`);
+        // Add delay to allow SMU to settle after enabling channel
+        setTimeout(() => {
+          console.log(`Calling set_current(${cyclerState.channel}, ${step.current})`);
+          set_current(cyclerState.channel, step.current);
+          console.log(`Channel ${cyclerState.channel} enabled for CC step - commands sent`);
+        }, 200); // 200ms delay for SMU settling
         break;
         
       case 'cv':
         console.log(`Setting CV mode: ${step.voltage}V on channel ${cyclerState.channel}`);
         console.log(`Calling enable_channel(${cyclerState.channel})`);
         enable_channel(cyclerState.channel);
-        console.log(`Calling set_potential(${cyclerState.channel}, ${step.voltage})`);
-        set_potential(cyclerState.channel, step.voltage);
-        console.log(`Channel ${cyclerState.channel} enabled for CV step - commands sent`);
+        // Add delay to allow SMU to settle after enabling channel
+        setTimeout(() => {
+          console.log(`Calling set_potential(${cyclerState.channel}, ${step.voltage})`);
+          set_potential(cyclerState.channel, step.voltage);
+          console.log(`Channel ${cyclerState.channel} enabled for CV step - commands sent`);
+        }, 200); // 200ms delay for SMU settling
         break;
         
       case 'ocv':
@@ -2242,6 +2289,7 @@ function startCycler(channel, steps, cycles = 0, enableLogging = true, testMetad
   cyclerState.cycleAh = 0;
   cyclerState.lastCurrent = 0;
   cyclerState.stepData = [];
+  cyclerState.lastLogTime = 0;  // Initialize logging timer
   
   // Initialize logging
   if (enableLogging) {
@@ -2449,6 +2497,25 @@ app.get('/cycler/status', (req, res) => {
     });
   } catch (error) {
     console.error('Error getting cycler status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Set cycler logging interval
+app.post('/cycler/set_log_interval', (req, res) => {
+  try {
+    const { intervalMs } = req.body;
+    if (intervalMs === undefined || intervalMs < 100) {
+      return res.status(400).json({ error: 'Interval must be at least 100ms' });
+    }
+    cyclerState.logIntervalMs = intervalMs;
+    res.json({ 
+      success: true, 
+      logIntervalMs: cyclerState.logIntervalMs,
+      message: `Cycler logging interval set to ${intervalMs}ms`
+    });
+  } catch (error) {
+    console.error('Error setting cycler log interval:', error);
     res.status(500).json({ error: error.message });
   }
 });
